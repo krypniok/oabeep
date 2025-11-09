@@ -1,0 +1,62 @@
+# kiki_art.csv — kiki’s machine shanty (alles drin)
+# feldreihenfolge: token , dauer_ms [, gap_ms] [, mode]
+# tip: tokens mit komma IM feld (stereo / stereo-glide) MÜSSEN in anführungszeichen stehen.
+
+# opening: sprache + zwei lange bg-pads (akkord & binaural)
+SAY@de:achtung maschine singt diesmal aber aner etwas länger und ohne komma!,0,0|BG
+
+ pause
+0,500,,
+
+
+C3+G3+C4,7000,0,BG
+220,7000,0,BINAURAL:7,BG
+
+# foreground-motiv (mono-noten)
+A4,180,40,
+C5,180,40,
+E5,240,80,
+G5,360,120,
+
+# stereo „ping“ (links/rechts), note: token gequotet
+"440,447",1200,60,
+
+# absoluter glide (start->ziel in hz)
+300,900,40,GLIDE:300->1200
+
+# relative glides (verhältnisse)
+A4,600,20,UPx:1.5
+A4,600,80,DOWNx:2
+
+# target-glides (von token-freq zu ziel-freq)
+392,700,40,UPTO:784
+392,700,120,DOWNTO:196
+
+# stereo-glide (links und rechts eigene bahn) – token gequotet
+"300~900,320~920",1200,120,
+
+# akkord in hz
+440+550+660,800,80,
+
+# pause
+0,200,,
+
+# talk in der mitte
+SAY@de:weiter gehts,1,40|BG
+
+# kleines motiv das wir gleich wiederholen
+E5,150,30,
+D5,150,30,
+C5,300,60,
+-3,2,,
+
+# finish: bg-stereo-schwebung + vordergrund-schläge
+"523.251,529.251",2000,0,BG
+780,500,30,
+660,500,30,
+0,150,,
+-4,1,,
+
+# coda
+SAY:done.,1,,
+
