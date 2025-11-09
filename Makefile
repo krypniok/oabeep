@@ -21,4 +21,4 @@ push:
 	@echo "==> committing..."
 	git commit -m "$(if $(m),$(m),auto-push from make)" || echo "==> no changes to commit"
 	@echo "==> force pushing..."
-	git push origin main --force
+	git push origin master --force
