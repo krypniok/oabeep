@@ -1,13 +1,16 @@
-# oabeep
+# oabeep – ein AI-gebauter `beep`-Nachfolger
 
-**oabeep** ist ein OpenAL-basiertes Beep/Play-Utility mit erweiterten Features.
-Es ersetzt das klassische `beep` durch einen flexiblen Sound-Synth mit:
+oabeep ist ein vollständiger Ersatz für das historische Linux-`beep`. Die Idee stammt zwar aus einer nostalgischen Sehnsucht nach Hardware-Beep-Skripten, aber *der komplette Code, Parser, Synth und jede einzelne Erweiterung wurden zu 100 % mit GPT/Codex gebaut und iteriert*. Kein einziger C‑Block stammt aus einem bestehenden Projekt – wir haben die Maschine die Arbeit erledigen lassen.
 
-* **Mono**
-* **Stereo**
-* **Glide (Frequenz-Slides)**
-* **Chords (Akkorde)**
-* **Rests (Pausen)**
+Warum das wichtig ist? Das klassische `beep` kann nur piepsen, viele Distributionen haben es aus Sicherheitsgründen entfernt und moderne Workflows (Audio-Feedback, Sonifikation, Sounddesign) brauchen einen flexiblen Synth mit Sequencer, Samples, Text‑to‑Speech usw. Ein Tool wie oabeep fehlte schlicht – also hat Codex es implementiert.
+
+Kurzüberblick:
+
+* **Mono/Stereo/Glide/Chords/Rests**
+* **Drums, Bass, Leads (KICK/SNARE/HAT/BASS/FLUTE/PIANO/GUITAR/EGTR)**
+* **Samples per `WAV("file.wav")`**
+* **CSV-Sampler mit BG/ADV, SAY-Events, Makros, Repeats**
+* **Alles in einem OpenAL-Binary**
 
 ---
 
@@ -27,6 +30,8 @@ oabeep -f sampler.csv [global options]
 * **Rest:** `r:ms` oder `0:ms` → Pause
 * **Synth-Percussion:** `KICK[:ms]`, `SNARE[:ms]`, `HAT[:ms]` → generierte Drums mit automatischer Hüllkurve
 * **Bass:** `BASS[@freq][:ms]` oder `BASS(C2)` → saturierter Bass-Oszillator; Frequenz optional (Default 55 Hz)
+* **Melodic Instruments:** `FLUTE`, `PIANO`, `GUITAR`, `EGTR`, `BIRDS`, `STRPAD`, `BELL`, `BRASS`, `KALIMBA` (+ optional `@Note`/`@Hz`)
+* **Samples:** `WAV("bells.wav")[:ms]` → bindet externe 16‑bit WAVs ein (mono oder stereo); Dauer optional (sonst Originalzeit)
 
 ### ⚙️ Global Options
 
@@ -48,7 +53,7 @@ token , duration_ms [, gap_ms] [, mode] [, flags]
 ```
 
 * `token`: Frequenz (`440`), Note (`C4`, `A#3`), Akkord (`440+550+660`), Stereo (`"440,447"`), Glide (`300~900`), Pause (`0`/`R`) oder Sprachbefehl `SAY@voice;opts:text`
-  * Zusätzliche Synth-Shortcuts: `KICK`, `SNARE`, `HAT`, `BASS` (+ optionale Parameter wie `BASS@42`, `KICK@180->40`)
+  * Zusätzliche Synth-/Sample-Shortcuts: `KICK`, `SNARE`, `HAT`, `BASS`, `FLUTE`, `PIANO`, `GUITAR`, `EGTR`, `BIRDS`, `STRPAD`, `BELL`, `BRASS`, `KALIMBA`, `WAV("file.wav")`
 * `duration_ms`: Pflicht, int
 * `gap_ms`: optional Ruhe danach (ms oder Sekundenbruchteile), z.B. `0.25`
 * `mode`: z.B. `GLIDE:300->1200`, `BINAURAL:7`, `UPx:1.2`. `|BG` oder `|ADV` können hier ebenfalls stehen.
@@ -59,6 +64,22 @@ Sonderzeilen:
 * `-SPAN,REPS` → wiederhole die **nächsten** `SPAN` Zeilen `REPS`‑mal (verschachtelt erlaubt)
 * Kommentare beginnen mit `#`, `//` oder `--`
 
+### 🎛️ Makros & Samples
+
+Am Dateianfang (vor der eigentlichen Timeline) kannst du Symbole definieren:
+
+```
+@HYPERBASS {
+BASS@45,800,60,BG|ADV
+KICK@150->40,200,20,BG|ADV
+SAY@de:hyperbass aktiviert!,0,0
+}
+```
+
+Später reicht eine Zeile `@HYPERBASS,0,0,` und der Block wird inline expandiert (rekursiv möglich). In Makros dürfen alle Token verwendet werden – inkl. `SAY@`, `BG/ADV`, weiteren `@MACROS` sowie `WAV("sample.wav")`.
+
+`WAV("…")` lädt externe 16‑bit PCM-WAVs (mono/stereo). Ohne explizite Dauer spielt oabeep das Sample in Originalgeschwindigkeit; mit `:ms` wird es streckt/gestaucht.
+
 Sprachereignisse benötigen `espeak`. Bei Bedarf über `-espeak /pfad/zu/espeak` setzen.
 
 Beispiel:
@@ -66,7 +87,11 @@ Beispiel:
 ```
 ./oabeep -g 0.3 -f thunderstruck.txt
 ./oabeep -f muse.txt -espeak /usr/bin/espeak
+./oabeep -g 0.28 -f flute_demo.txt
+./oabeep -g 0.3 -f macro_demo.txt
 ```
+
+Weitere Beispiele findest du in `flute_demo.txt`, `piano_demo.txt`, `guitar_demo.txt`, `egtr_demo.txt`, `macro_demo.txt` sowie `beat_demo.txt`.
 
 ---
 

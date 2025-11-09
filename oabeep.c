@@ -26,7 +26,22 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+typedef struct {
+    float *chan[2];
+    int channels;
+    int length;
+    int sample_rate;
+} SampleData;
+
+typedef struct {
+    char *path;
+    SampleData data;
+} SampleCacheEntry;
+
 static uint32_t noise_state = 0x12345678u;
+
+static SampleCacheEntry *sample_cache=NULL;
+static size_t sample_cache_len=0, sample_cache_cap=0;
 
 static inline float frand_unit(void){
     noise_state = noise_state * 1664525u + 1013904223u;
@@ -41,7 +56,17 @@ typedef enum {
     SPEC_KICK,
     SPEC_SNARE,
     SPEC_HIHAT,
-    SPEC_BASS
+    SPEC_BASS,
+    SPEC_FLUTE,
+    SPEC_PIANO,
+    SPEC_GUITAR,
+    SPEC_EGTR,
+    SPEC_SAMPLE,
+    SPEC_BIRDS,
+    SPEC_STRPAD,
+    SPEC_BELL,
+    SPEC_BRASS,
+    SPEC_KALIMBA
 } SpecType;
 
 typedef struct {
@@ -49,6 +74,8 @@ typedef struct {
     float f_const;           // CONST
     float f0, f1;            // GLIDE
     float chord[16]; int n;  // CHORD (max 16 partials)
+    SampleData *sample;
+    int sample_channel;
 } Spec;
 
 typedef struct {
@@ -56,6 +83,8 @@ typedef struct {
     bool stereo;
     int dur_ms;
     int samples;
+    bool explicit_dur;
+    bool sample_override;
 } Token;
 
 typedef struct {
@@ -94,7 +123,45 @@ typedef struct {
     size_t cap;
 } SpeechVec;
 
+typedef struct {
+    char *name;
+    CsvRowVec rows;
+} MacroDef;
+
+typedef struct {
+    MacroDef *items;
+    size_t len;
+    size_t cap;
+} MacroVec;
+
 static void die(const char *msg);
+
+static char *strdup_upper(const char *s){
+    if(!s) return NULL;
+    size_t len=strlen(s);
+    char *r=malloc(len+1);
+    if(!r) die("oom");
+    for(size_t i=0;i<len;i++){
+        unsigned char c=(unsigned char)s[i];
+        r[i]=(char)toupper(c);
+    }
+    r[len]='\0';
+    return r;
+}
+
+static void sample_data_free(SampleData *sd){
+    if(!sd) return;
+    free(sd->chan[0]);
+    free(sd->chan[1]);
+    sd->chan[0]=sd->chan[1]=NULL;
+    sd->channels=0;
+    sd->length=0;
+    sd->sample_rate=0;
+}
+
+static void macro_vec_free(MacroVec *vec);
+static void csv_row_free(CsvRow *row);
+static void csv_rowvec_free(CsvRowVec *vec);
 static void synth_spec_into(const Spec *sp, float *dst, int n, int sr);
 static void apply_fade(float *x, int n, int sr, int fade_ms);
 static int play_buffer_with_openal(const float *L, const float *R, size_t total_samples, float gain, int sr, const SpeechVec *speech, const char *espeak_bin);
@@ -111,6 +178,125 @@ static bool parse_float(const char *s, float *out){
     char *e=NULL; float v=strtof(s,&e);
     if(e==s || (e && *e!='\0')) return false;
     *out=v; return true;
+}
+
+static char *dup_unquoted(const char *s){
+    if(!s) return NULL;
+    while(*s==' '||*s=='\t') s++;
+    size_t len=strlen(s);
+    while(len>0 && isspace((unsigned char)s[len-1])) len--;
+    if(len>=2 && ((s[0]=='\"' && s[len-1]=='\"') || (s[0]=='\'' && s[len-1]=='\''))){
+        char *out=malloc(len-1);
+        if(!out) die("oom");
+        memcpy(out,s+1,len-2);
+        out[len-2]='\0';
+        return out;
+    }
+    char *out=malloc(len+1);
+    if(!out) die("oom");
+    memcpy(out,s,len);
+    out[len]='\0';
+    return out;
+}
+
+static bool load_wav_file(const char *path, SampleData *out){
+    memset(out,0,sizeof(*out));
+    FILE *fp=fopen(path,"rb");
+    if(!fp){
+        fprintf(stderr,"wav open failed %s: %s\n", path, strerror(errno));
+        return false;
+    }
+    char id[4];
+    if(fread(id,1,4,fp)!=4 || memcmp(id,"RIFF",4)!=0){ fclose(fp); fprintf(stderr,"wav %s missing RIFF\n",path); return false; }
+    uint32_t riff_size=0;
+    fread(&riff_size,4,1,fp);
+    if(fread(id,1,4,fp)!=4 || memcmp(id,"WAVE",4)!=0){ fclose(fp); fprintf(stderr,"wav %s missing WAVE\n",path); return false; }
+    uint16_t audio_format=0, channels=0, bits_per_sample=0;
+    uint32_t sample_rate=0;
+    bool fmt_found=false, data_found=false;
+    uint8_t *raw=NULL;
+    size_t raw_frames=0;
+    while(fread(id,1,4,fp)==4){
+        uint32_t chunk_size=0;
+        if(fread(&chunk_size,4,1,fp)!=1) break;
+        long chunk_start=ftell(fp);
+        if(memcmp(id,"fmt ",4)==0){
+            if(chunk_size < 16){ fprintf(stderr,"wav %s bad fmt chunk\n",path); goto fail; }
+            fread(&audio_format,2,1,fp);
+            fread(&channels,2,1,fp);
+            fread(&sample_rate,4,1,fp);
+            uint32_t byte_rate=0; fread(&byte_rate,4,1,fp);
+            uint16_t block_align=0; fread(&block_align,2,1,fp);
+            fread(&bits_per_sample,2,1,fp);
+            if(chunk_size>16) fseek(fp, chunk_size-16, SEEK_CUR);
+            if(audio_format!=1 || (channels!=1 && channels!=2) || bits_per_sample!=16){
+                fprintf(stderr,"wav %s unsupported format (pcm16 mono/stereo only)\n",path);
+                goto fail;
+            }
+            fmt_found=true;
+        }else if(memcmp(id,"data",4)==0){
+            if(!fmt_found){ fprintf(stderr,"wav %s data before fmt\n",path); goto fail; }
+            raw = malloc(chunk_size);
+            if(!raw) die("oom");
+            if(fread(raw,1,chunk_size,fp)!=chunk_size){ fprintf(stderr,"wav %s truncated data\n",path); goto fail; }
+            raw_frames = chunk_size / (channels * (bits_per_sample/8));
+            data_found=true;
+        }else{
+            fseek(fp, chunk_size, SEEK_CUR);
+        }
+        if(chunk_size & 1) fseek(fp,1,SEEK_CUR);
+        if(data_found) break;
+    }
+    fclose(fp);
+    if(!fmt_found || !data_found || !raw){
+        fprintf(stderr,"wav %s missing chunks\n",path);
+        free(raw);
+        return false;
+    }
+    out->channels = channels;
+    out->length = (int)raw_frames;
+    out->sample_rate = (int)sample_rate;
+    for(int c=0;c<channels;c++){
+        out->chan[c]=calloc(raw_frames,sizeof(float));
+        if(!out->chan[c]) die("oom");
+    }
+    const int16_t *src=(const int16_t*)raw;
+    for(size_t i=0;i<raw_frames;i++){
+        for(int c=0;c<channels;c++){
+            int16_t v = src[i*channels + c];
+            out->chan[c][i] = (float)v / 32768.f;
+        }
+    }
+    if(channels==1) out->chan[1]=NULL;
+    free(raw);
+    return true;
+fail:
+    fclose(fp);
+    free(raw);
+    sample_data_free(out);
+    return false;
+}
+
+static SampleData *sample_cache_get(const char *path){
+    for(size_t i=0;i<sample_cache_len;i++){
+        if(strcmp(sample_cache[i].path,path)==0) return &sample_cache[i].data;
+    }
+    SampleCacheEntry entry={0};
+    entry.path=strdup(path);
+    if(!entry.path) die("oom");
+    if(!load_wav_file(path,&entry.data)){
+        free(entry.path);
+        return NULL;
+    }
+    if(sample_cache_len==sample_cache_cap){
+        size_t n = sample_cache_cap?sample_cache_cap*2:8;
+        SampleCacheEntry *tmp=realloc(sample_cache, n*sizeof(*tmp));
+        if(!tmp) die("oom");
+        sample_cache=tmp;
+        sample_cache_cap=n;
+    }
+    sample_cache[sample_cache_len++] = entry;
+    return &sample_cache[sample_cache_len-1].data;
 }
 
 static bool extract_note_symbol(const char *s, char *out, size_t out_sz){
@@ -202,6 +388,18 @@ static bool parse_named_spec(const char *s, Spec *sp){
             break;
         }
     }
+    if(strncasecmp(buf,"WAV",3)==0 || strcasecmp(buf,"SAMPLE")==0){
+        if(!param || !*param) return false;
+        char *path = dup_unquoted(param);
+        if(!path) return false;
+        SampleData *sd = sample_cache_get(path);
+        free(path);
+        if(!sd) return false;
+        sp->type=SPEC_SAMPLE;
+        sp->sample=sd;
+        sp->sample_channel=0;
+        return true;
+    }
     if(strcasecmp(buf,"KICK")==0 || strcasecmp(buf,"BD")==0){
         float start=140.f, endf=40.f;
         if(param && *param){
@@ -268,11 +466,97 @@ static bool parse_named_spec(const char *s, Spec *sp){
         sp->f_const=freq;
         return true;
     }
+    if(strncasecmp(buf,"FLUTE",5)==0){
+        float freq=523.25f; // C5
+        if(param && *param){
+            float v=0;
+            if(parse_freq_value(param,&v) && v>0) freq=v;
+        }
+        sp->type=SPEC_FLUTE;
+        sp->f_const=freq;
+        return true;
+    }
+    if(strncasecmp(buf,"PIANO",5)==0){
+        float freq=440.f;
+        if(param && *param){
+            float v=0;
+            if(parse_freq_value(param,&v) && v>0) freq=v;
+        }
+        sp->type=SPEC_PIANO;
+        sp->f_const=freq;
+        return true;
+    }
+    if(strcasecmp(buf,"GUITAR")==0 || strcasecmp(buf,"GT")==0){
+        float freq=330.f;
+        if(param && *param){
+            float v=0;
+            if(parse_freq_value(param,&v) && v>0) freq=v;
+        }
+        sp->type=SPEC_GUITAR;
+        sp->f_const=freq;
+        return true;
+    }
+    if(strcasecmp(buf,"EGTR")==0 || strcasecmp(buf,"EGUITAR")==0){
+        float freq=196.f;
+        if(param && *param){
+            float v=0;
+            if(parse_freq_value(param,&v) && v>0) freq=v;
+        }
+        sp->type=SPEC_EGTR;
+        sp->f_const=freq;
+        return true;
+    }
+    if(strcasecmp(buf,"BIRDS")==0){
+        sp->type=SPEC_BIRDS;
+        sp->f_const = (param && *param) ? atof(param) : 6000.f;
+        if(sp->f_const<=0.f) sp->f_const=6000.f;
+        return true;
+    }
+    if(strcasecmp(buf,"STRPAD")==0 || strcasecmp(buf,"PAD")==0){
+        float freq=440.f;
+        if(param && *param){
+            float v=0;
+            if(parse_freq_value(param,&v) && v>0) freq=v;
+        }
+        sp->type=SPEC_STRPAD;
+        sp->f_const=freq;
+        return true;
+    }
+    if(strcasecmp(buf,"BELL")==0){
+        float freq=880.f;
+        if(param && *param){
+            float v=0;
+            if(parse_freq_value(param,&v) && v>0) freq=v;
+        }
+        sp->type=SPEC_BELL;
+        sp->f_const=freq;
+        return true;
+    }
+    if(strcasecmp(buf,"BRASS")==0){
+        float freq=330.f;
+        if(param && *param){
+            float v=0;
+            if(parse_freq_value(param,&v) && v>0) freq=v;
+        }
+        sp->type=SPEC_BRASS;
+        sp->f_const=freq;
+        return true;
+    }
+    if(strcasecmp(buf,"KALIMBA")==0 || strcasecmp(buf,"KORA")==0){
+        float freq=392.f;
+        if(param && *param){
+            float v=0;
+            if(parse_freq_value(param,&v) && v>0) freq=v;
+        }
+        sp->type=SPEC_KALIMBA;
+        sp->f_const=freq;
+        return true;
+    }
     return false;
 }
 
 static Spec parse_spec(const char *s){
-    Spec sp={.type=SPEC_CONST,.f_const=0};
+    Spec sp={.type=SPEC_CONST,.f_const=0,.sample=NULL,.sample_channel=0};
     if(!s || !*s){ sp.type=SPEC_SILENCE; return sp; }
     if ((s[0]=='r' || s[0]=='R') && (s[1]==0 || s[1]==':')){ sp.type=SPEC_SILENCE; return sp; }
     Spec named;
@@ -342,20 +626,42 @@ static int ms_to_samples_allow_zero(int ms, int sr){
     return samples;
 }
 
+static int sample_default_length(const Spec *sp, int sr){
+    if(!sp || sp->type!=SPEC_SAMPLE || !sp->sample || sp->sample->sample_rate<=0) return 0;
+    double seconds = (double)sp->sample->length / (double)sp->sample->sample_rate;
+    int n = (int)lrint(seconds * (double)sr);
+    if(n<1) n=1;
+    return n;
+}
+
+static int token_target_samples(const Token *tok, int sr){
+    if(tok->sample_override){
+        int n = sample_default_length(&tok->L, sr);
+        if(n<=0) n = sample_default_length(&tok->R, sr);
+        if(n>0) return n;
+    }
+    return ms_to_samples(tok->dur_ms, sr);
+}
+
 static bool parse_token(const char *arg, int def_ms, Token *out){
     char *dup=strdup(arg); if(!dup) return false;
     char *col=strrchr(dup,':'); // last ':' as duration sep
     int dur = def_ms;
+    bool explicit_dur=false;
     if(col){
         *col='\0';
         char *d=col+1;
         trim(d);
-        if(!parse_int_strict(d, &dur) || dur<=0) dur = def_ms;
+        if(parse_int_strict(d, &dur) && dur>0){
+            explicit_dur=true;
+        }else{
+            dur = def_ms;
+        }
     }
     char *body=dup; trim(body);
     // rest token can be "r:ms" or "0:ms"
     if( (body[0]=='r'||body[0]=='R'||body[0]=='0') && (body[1]==0) ){
-        out->L.type=SPEC_SILENCE; out->R.type=SPEC_SILENCE; out->stereo=false; out->dur_ms=dur; out->samples=0; free(dup); return true;
+        out->L.type=SPEC_SILENCE; out->R.type=SPEC_SILENCE; out->stereo=false; out->dur_ms=dur; out->samples=0; out->explicit_dur=explicit_dur; out->sample_override=false; free(dup); return true;
     }
     // stereo if comma present at top-level
     char *comma = NULL;
@@ -370,9 +676,21 @@ static bool parse_token(const char *arg, int def_ms, Token *out){
         out->L = parse_spec(body);
         out->R = out->L;
         out->stereo=false;
+        if(out->L.type==SPEC_SAMPLE && out->L.sample){
+            if(out->L.sample->channels>1){
+                out->stereo=true;
+                out->L.sample_channel=0;
+                out->R.sample_channel=1;
+            }else{
+                out->L.sample_channel=0;
+                out->R.sample_channel=0;
+            }
+        }
     }
     out->dur_ms = dur;
     out->samples = 0;
+    out->explicit_dur = explicit_dur;
+    out->sample_override = (!explicit_dur) && ((out->L.type==SPEC_SAMPLE && out->L.sample) || (out->R.type==SPEC_SAMPLE && out->R.sample));
     free(dup); return true;
 }
 
@@ -419,6 +737,46 @@ static void csv_rowvec_free(CsvRowVec *vec){
     free(vec->items);
     vec->items=NULL;
     vec->len=vec->cap=0;
+}
+
+static void macro_def_free(MacroDef *def){
+    if(!def) return;
+    free(def->name);
+    csv_rowvec_free(&def->rows);
+}
+
+static void macro_vec_push(MacroVec *vec, MacroDef def){
+    if(vec->len==vec->cap){
+        size_t n = vec->cap?vec->cap*2:8;
+        MacroDef *tmp=realloc(vec->items, n*sizeof(MacroDef));
+        if(!tmp) die("oom");
+        vec->items=tmp;
+        vec->cap=n;
+    }
+    vec->items[vec->len++] = def;
+}
+
+static void macro_vec_free(MacroVec *vec){
+    if(!vec) return;
+    for(size_t i=0;i<vec->len;i++) macro_def_free(&vec->items[i]);
+    free(vec->items);
+    vec->items=NULL;
+    vec->len=vec->cap=0;
+}
+
+static MacroDef *macro_find(MacroVec *vec, const char *name){
+    if(!name) return NULL;
+    char *upper=strdup_upper(name);
+    if(!upper) return NULL;
+    MacroDef *result=NULL;
+    for(size_t i=0;i<vec->len;i++){
+        if(vec->items[i].name && strcasecmp(vec->items[i].name, upper)==0){
+            result=&vec->items[i];
+            break;
+        }
+    }
+    free(upper);
+    return result;
 }
 
 static char *collect_field(const char *start, size_t len){
@@ -485,7 +843,7 @@ static bool parse_csv_line(const char *line, CsvRow *row){
     return col>0;
 }
 
-static bool load_sequence_rows(const char *path, CsvRowVec *rows){
+static bool load_sequence_rows(const char *path, CsvRowVec *rows, MacroVec *macros){
     FILE *fp=fopen(path,"r");
     if(!fp){
         fprintf(stderr,"konnte %s nicht öffnen: %s\n", path, strerror(errno));
@@ -494,6 +852,55 @@ static bool load_sequence_rows(const char *path, CsvRowVec *rows){
     char *line=NULL;
     size_t cap=0;
     while(getline(&line,&cap,fp)!=-1){
+        char *trim_line = dup_trimmed(line);
+        if(!trim_line) continue;
+        if(trim_line[0]=='\0' || trim_line[0]=='#' || strncmp(trim_line,"//",2)==0 || strncmp(trim_line,"--",2)==0){
+            free(trim_line);
+            continue;
+        }
+        if(trim_line[0]=='@'){
+            char *brace=strchr(trim_line,'{');
+            if(brace){
+                *brace='\0';
+                char *name=trim_line+1;
+                trim(name);
+                MacroDef def={0};
+                def.name=strdup_upper(name);
+                if(!def.name) die("oom");
+                bool closed=false;
+                while(getline(&line,&cap,fp)!=-1){
+                    char *inner=dup_trimmed(line);
+                    if(!inner) continue;
+                    if(inner[0]=='\0' || inner[0]=='#' || strncmp(inner,"//",2)==0 || strncmp(inner,"--",2)==0){
+                        free(inner);
+                        continue;
+                    }
+                    if(inner[0]=='}'){
+                        free(inner);
+                        closed=true;
+                        break;
+                    }
+                    CsvRow row;
+                    if(parse_csv_line(line,&row)){
+                        if(row.cols[0] && row.cols[0][0]!='\0'){
+                            csv_rowvec_push(&def.rows, row);
+                        }else{
+                            csv_row_free(&row);
+                        }
+                    }
+                    free(inner);
+                }
+                if(!closed){
+                    fprintf(stderr,"macro %s missing closing brace in %s\n", name, path);
+                    macro_def_free(&def);
+                }else{
+                    macro_vec_push(macros, def);
+                }
+                free(trim_line);
+                continue;
+            }
+        }
+        free(trim_line);
         CsvRow row;
         if(!parse_csv_line(line,&row)){
             continue;
@@ -560,6 +967,44 @@ static bool expand_repeats(const CsvRowVec *src, CsvRowVec *dst){
         }
         csv_rowvec_push(dst, csv_row_clone(row));
         i++;
+    }
+    return true;
+}
+
+static bool expand_macro_rows(const MacroDef *macro, MacroVec *macros, CsvRowVec *dst, int depth){
+    if(depth>16){
+        fprintf(stderr,"macro recursion too deep for %s\n", macro->name);
+        return false;
+    }
+    for(size_t i=0;i<macro->rows.len;i++){
+        const CsvRow *row=&macro->rows.items[i];
+        const char *tok=row->cols[0];
+        if(tok && tok[0]=='@' && tok[1]!='\0'){
+            MacroDef *inner = macro_find(macros, tok+1);
+            if(!inner){
+                fprintf(stderr,"unknown macro reference %s inside %s\n", tok, macro->name);
+                return false;
+            }
+            if(!expand_macro_rows(inner, macros, dst, depth+1)) return false;
+            continue;
+        }
+        csv_rowvec_push(dst, csv_row_clone(row));
+    }
+    return true;
+}
+
+static bool expand_macros(const CsvRowVec *src, MacroVec *macros, CsvRowVec *dst){
+    for(size_t i=0;i<src->len;i++){
+        const CsvRow *row=&src->items[i];
+        const char *tok=row->cols[0];
+        if(tok && tok[0]=='@' && tok[1]!='\0'){
+            MacroDef *macro = macro_find(macros, tok+1);
+            if(macro){
+                if(!expand_macro_rows(macro, macros, dst, 1)) return false;
+                continue;
+            }
+        }
+        csv_rowvec_push(dst, csv_row_clone(row));
     }
     return true;
 }
@@ -921,7 +1366,7 @@ static bool build_sequence_events(const CsvRowVec *rows, int sr, int def_ms, Ren
         }
         free(token_with_dur);
         apply_mode_to_token(&t, mode_clean);
-        int tone_samples = ms_to_samples(t.dur_ms, sr);
+        int tone_samples = token_target_samples(&t, sr);
         bool advance = (!is_bg || adv);
         if(t.L.type==SPEC_SILENCE && t.R.type==SPEC_SILENCE){
             if(advance){
@@ -983,10 +1428,22 @@ static void launch_espeak_event(const SpeechEvent *ev, const char *espeak_bin){
 }
 
 static int play_sequence_file(const char *path, int sr, int def_ms, int fade_ms, float gain, const char *espeak_bin){
-    CsvRowVec raw={0}, expanded={0};
-    if(!load_sequence_rows(path,&raw)) return 1;
-    expand_repeats(&raw,&expanded);
+    CsvRowVec raw={0}, macro_applied={0}, expanded={0};
+    MacroVec macros={0};
+    if(!load_sequence_rows(path,&raw,&macros)){
+        macro_vec_free(&macros);
+        return 1;
+    }
+    if(!expand_macros(&raw,&macros,&macro_applied)){
+        csv_rowvec_free(&raw);
+        macro_vec_free(&macros);
+        csv_rowvec_free(&macro_applied);
+        return 1;
+    }
+    expand_repeats(&macro_applied,&expanded);
     csv_rowvec_free(&raw);
+    csv_rowvec_free(&macro_applied);
+    macro_vec_free(&macros);
 
     RenderVec tones={0};
     SpeechVec speech={0};
@@ -1118,6 +1575,211 @@ static void synth_bass_into(float *dst, int n, int sr, float freq){
     }
 }
 
+static void synth_flute_into(float *dst, int n, int sr, float freq){
+    if(freq<=0.f) freq=523.25f;
+    float phase=0.f, phase2=0.f;
+    float breath=0.f;
+    int attack = (int)(0.01f*sr);
+    if(attack<1) attack=1;
+    int release = (int)(0.08f*sr);
+    if(release<1) release=1;
+    for(int i=0;i<n;i++){
+        phase += freq/(float)sr;
+        phase2 += (freq*2.f)/(float)sr;
+        if(phase>1.f) phase -= floorf(phase);
+        if(phase2>1.f) phase2 -= floorf(phase2);
+        float tone = 0.85f*sine(phase) + 0.15f*sine(phase2);
+        breath += 0.25f*(frand_unit()-breath);
+        float t_env;
+        if(i<attack) t_env = (float)i/(float)attack;
+        else if(i>n-release){
+            int remain = n-i;
+            t_env = remain>0 ? (float)remain/(float)release : 0.f;
+        }else{
+            float u=(float)i/(float)(n>1?n-1:1);
+            t_env = expf(-1.8f*u);
+        }
+        dst[i] = (tone + 0.1f*breath)*t_env;
+    }
+}
+
+static void synth_piano_into(float *dst, int n, int sr, float freq){
+    if(freq<=0.f) freq=440.f;
+    float phase1=0.f, phase2=0.f, phase3=0.f;
+    for(int i=0;i<n;i++){
+        float t=(float)i/(float)sr;
+        float env1=expf(-3.5f*t);
+        float env2=expf(-6.0f*t);
+        float env3=expf(-9.0f*t);
+        phase1 += freq/(float)sr;
+        phase2 += (freq*2.01f)/(float)sr;
+        phase3 += (freq*3.01f)/(float)sr;
+        if(phase1>1.f) phase1 -= floorf(phase1);
+        if(phase2>1.f) phase2 -= floorf(phase2);
+        if(phase3>1.f) phase3 -= floorf(phase3);
+        float sample = 0.7f*sine(phase1)*env1 +
+                       0.25f*sine(phase2)*env2 +
+                       0.15f*sine(phase3)*env3;
+        dst[i]=sample;
+    }
+}
+
+static void synth_guitar_into(float *dst, int n, int sr, float freq){
+    if(freq<=0.f) freq=330.f;
+    int period = (int)((float)sr / freq);
+    if(period<2) period=2;
+    float *buf = malloc((size_t)period * sizeof(float));
+    if(!buf){ memset(dst,0,n*sizeof(float)); return; }
+    for(int k=0;k<period;k++) buf[k]=frand_unit();
+    int idx=0;
+    for(int i=0;i<n;i++){
+        int next = (idx+1)%period;
+        float value = 0.5f*(buf[idx] + buf[next]);
+        buf[idx] = value * 0.996f;
+        float u = (float)i/(float)(n>1?n-1:1);
+        float env = expf(-4.0f*u);
+        dst[i]=value*env;
+        idx = next;
+    }
+    free(buf);
+}
+
+static void synth_egtr_into(float *dst, int n, int sr, float freq){
+    if(freq<=0.f) freq=196.f;
+    float phase=0.f;
+    float vibr=0.f;
+    for(int i=0;i<n;i++){
+        float t=(float)i/(float)sr;
+        vibr += 0.002f*(frand_unit()-vibr);
+        phase += (freq*(1.f+0.01f*vibr))/(float)sr;
+        if(phase>1.f) phase -= floorf(phase);
+        float saw = 2.f*phase - 1.f;
+        float square = saw >=0 ? 1.f : -1.f;
+        float mix = 0.6f*saw + 0.4f*square;
+        float driven = tanhf(mix*3.0f);
+        float env = expf(-2.5f*t);
+        dst[i]=driven*env;
+    }
+}
+
+static void synth_sample_into(float *dst, int n, const SampleData *sd, int channel){
+    if(!sd || !sd->chan[0] || sd->length<=0){
+        memset(dst,0,(size_t)n*sizeof(float));
+        return;
+    }
+    if(channel >= sd->channels) channel = 0;
+    if(channel<0) channel=0;
+    const float *src = sd->chan[channel];
+    if(!src){
+        memset(dst,0,(size_t)n*sizeof(float));
+        return;
+    }
+    if(sd->length==1){
+        for(int i=0;i<n;i++) dst[i]=src[0];
+        return;
+    }
+    double step = (double)sd->length / (double)n;
+    double pos = 0.0;
+    for(int i=0;i<n;i++){
+        int idx = (int)pos;
+        if(idx >= sd->length-1){
+            dst[i] = src[sd->length-1];
+        }else{
+            double frac = pos - idx;
+            float a = src[idx];
+            float b = src[idx+1];
+            dst[i] = (float)(a + (b - a)*frac);
+        }
+        pos += step;
+    }
+}
+
+static void synth_birds_into(float *dst, int n, int sr, float base){
+    if(base<=0.f) base=6000.f;
+    float freq=base;
+    float phase=0.f;
+    float noise=0.f;
+    for(int i=0;i<n;i++){
+        float u=(float)i/(float)(n>1?n-1:1);
+        if(i%(sr/20)==0){
+            freq = base + frand_unit()*800.f;
+        }
+        phase += freq/(float)sr;
+        if(phase>1.f) phase -= floorf(phase);
+        noise += 0.3f*(frand_unit()-noise);
+        float chirp = sine(phase) * expf(-6.f*u);
+        dst[i] = (chirp + 0.4f*noise)*0.7f;
+    }
+}
+
+static void synth_strpad_into(float *dst, int n, int sr, float freq){
+    if(freq<=0.f) freq=440.f;
+    float phase1=0.f, phase2=0.f, phase3=0.f;
+    for(int i=0;i<n;i++){
+        float t=(float)i/(float)sr;
+        float env = (t<0.15f) ? (t/0.15f) : expf(-1.2f*(t-0.15f));
+        phase1 += freq/(float)sr;
+        phase2 += (freq*2.01f)/(float)sr;
+        phase3 += (freq*0.5f)/(float)sr;
+        if(phase1>1.f) phase1 -= floorf(phase1);
+        if(phase2>1.f) phase2 -= floorf(phase2);
+        if(phase3>1.f) phase3 -= floorf(phase3);
+        float sample = 0.5f*sine(phase1) + 0.3f*sine(phase2) + 0.2f*sine(phase3);
+        dst[i]=sample*env;
+    }
+}
+
+static void synth_bell_into(float *dst, int n, int sr, float freq){
+    if(freq<=0.f) freq=880.f;
+    float phase1=0.f, phase2=0.f, phase3=0.f;
+    for(int i=0;i<n;i++){
+        float t=(float)i/(float)sr;
+        float env=expf(-4.0f*t);
+        phase1 += freq/(float)sr;
+        phase2 += (freq*2.7f)/(float)sr;
+        phase3 += (freq*3.9f)/(float)sr;
+        if(phase1>1.f) phase1-=floorf(phase1);
+        if(phase2>1.f) phase2-=floorf(phase2);
+        if(phase3>1.f) phase3-=floorf(phase3);
+        float sample = 0.6f*sine(phase1)+0.25f*sine(phase2)+0.15f*sine(phase3);
+        dst[i]=sample*env;
+    }
+}
+
+static void synth_brass_into(float *dst, int n, int sr, float freq){
+    if(freq<=0.f) freq=330.f;
+    float phase=0.f;
+    float filt=0.f;
+    for(int i=0;i<n;i++){
+        float t=(float)i/(float)n;
+        phase += freq/(float)sr;
+        if(phase>1.f) phase-=floorf(phase);
+        float saw = 2.f*phase - 1.f;
+        filt += 0.05f*(saw - filt);
+        float env = (t<0.1f)? (t/0.1f) : expf(-2.5f*(t-0.1f));
+        dst[i] = tanhf(filt*3.f) * env;
+    }
+}
+
+static void synth_kalimba_into(float *dst, int n, int sr, float freq){
+    if(freq<=0.f) freq=392.f;
+    int period = (int)((float)sr / freq);
+    if(period<2) period=2;
+    float *buf = malloc((size_t)period * sizeof(float));
+    if(!buf){ memset(dst,0,n*sizeof(float)); return; }
+    for(int i=0;i<period;i++) buf[i]=frand_unit();
+    int idx=0;
+    for(int i=0;i<n;i++){
+        int next=(idx+1)%period;
+        float value = 0.5f*(buf[idx]+buf[next]);
+        buf[idx] = value * 0.998f;
+        float env = expf(-3.5f*(float)i/(float)n);
+        dst[i]=value*env;
+        idx=next;
+    }
+    free(buf);
+}
+
 static void synth_spec_into(const Spec *sp, float *dst, int n, int sr){
     if(sp->type==SPEC_SILENCE){ memset(dst,0,n*sizeof(float)); return; }
     if(sp->type==SPEC_CONST){
@@ -1161,6 +1823,46 @@ static void synth_spec_into(const Spec *sp, float *dst, int n, int sr){
     }
     if(sp->type==SPEC_BASS){
         synth_bass_into(dst, n, sr, sp->f_const);
+        return;
+    }
+    if(sp->type==SPEC_FLUTE){
+        synth_flute_into(dst, n, sr, sp->f_const);
+        return;
+    }
+    if(sp->type==SPEC_PIANO){
+        synth_piano_into(dst, n, sr, sp->f_const);
+        return;
+    }
+    if(sp->type==SPEC_GUITAR){
+        synth_guitar_into(dst, n, sr, sp->f_const);
+        return;
+    }
+    if(sp->type==SPEC_EGTR){
+        synth_egtr_into(dst, n, sr, sp->f_const);
+        return;
+    }
+    if(sp->type==SPEC_SAMPLE){
+        synth_sample_into(dst, n, sp->sample, sp->sample_channel);
+        return;
+    }
+    if(sp->type==SPEC_BIRDS){
+        synth_birds_into(dst, n, sr, sp->f_const);
+        return;
+    }
+    if(sp->type==SPEC_STRPAD){
+        synth_strpad_into(dst, n, sr, sp->f_const);
+        return;
+    }
+    if(sp->type==SPEC_BELL){
+        synth_bell_into(dst, n, sr, sp->f_const);
+        return;
+    }
+    if(sp->type==SPEC_BRASS){
+        synth_brass_into(dst, n, sr, sp->f_const);
+        return;
+    }
+    if(sp->type==SPEC_KALIMBA){
+        synth_kalimba_into(dst, n, sr, sp->f_const);
         return;
     }
 }
@@ -1306,7 +2008,7 @@ int main(int argc, char **argv){
     size_t total_samples=0;
     for(; i<argc; ++i){
         if(!parse_token(argv[i], def_ms, &tok[nt])){ free(tok); die("parse error"); }
-        tok[nt].samples = ms_to_samples(tok[nt].dur_ms, sr);
+        tok[nt].samples = token_target_samples(&tok[nt], sr);
         if(total_samples > SIZE_MAX - (size_t)tok[nt].samples) die("sequence too long");
         total_samples += (size_t)tok[nt].samples;
         nt++;
