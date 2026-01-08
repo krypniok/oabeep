@@ -1,7 +1,5 @@
-// oabeep.c - OpenAL "beep"-Ersatz mit Mono/Stereo, Glide, Chords, Rests.
-// Usage: oabeep [global opts] token [token...]
-// Tokens: mono: F[:ms]  | stereo: L,R[:ms]  | glide: A~B[:ms]  | chord: f1+f2+...[:ms] | rest: r:ms / 0:ms
-// Global: -g gain(0..1) -sr samplerate -l default_ms -fade fadems
+// oabeep.c - OpenAL Realtime Streaming Synth (Atomsirenen-Edition)
+// gcc -o oabeep binaural.c -lopenal -lm
 
 #define _GNU_SOURCE
 #include <AL/al.h>
@@ -19,24 +17,27 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-typedef enum { SPEC_SILENCE=0, SPEC_CONST, SPEC_GLIDE, SPEC_CHORD } SpecType;
+#define NUM_BUFFERS 4
+#define CHUNK_SIZE 2048 
+
+typedef enum { SPEC_SILENCE=0, SPEC_CONST, SPEC_GLIDE, SPEC_CHORD_GLIDE } SpecType;
 
 typedef struct {
     SpecType type;
-    float f_const;           // CONST
-    float f0, f1;            // GLIDE
-    float chord[16]; int n;  // CHORD (max 16 partials)
+    int n;                      // Anzahl der Töne im Akkord
+    float f0[16], f1[16];       // Start- und Zielfrequenzen
+    double phase_acc[16];       // Individuelle Phasen für lückenlosen Sound
 } Spec;
 
 typedef struct {
     Spec L, R;
-    bool stereo;
     int dur_ms;
 } Token;
 
+// --- Parser-Werkstatt ---
+
 static void trim(char *s){
-    // strip spaces
-    size_t n=strlen(s); size_t i=0,j=n;
+    size_t n=strlen(s), i=0, j=n;
     while(i<n && isspace((unsigned char)s[i])) i++;
     while(j>i && isspace((unsigned char)s[j-1])) j--;
     memmove(s, s+i, j-i); s[j-i]='\0';
@@ -48,208 +49,161 @@ static bool parse_float(const char *s, float *out){
     *out=v; return true;
 }
 
-static Spec parse_spec(const char *s){
-    Spec sp={.type=SPEC_CONST,.f_const=0};
-    if(!s || !*s){ sp.type=SPEC_SILENCE; return sp; }
-    if ((s[0]=='r' || s[0]=='R') && (s[1]==0 || s[1]==':')){ sp.type=SPEC_SILENCE; return sp; }
-    // contains '~' -> glide
-    const char *tilde=strchr(s,'~');
-    const char *plus=strchr(s,'+');
-    if(tilde){
+// Zerlegt einen Part (z.B. "200~600" oder "440")
+static void parse_single_glide(const char *s, float *f0, float *f1) {
+    const char *tilde = strchr(s, '~');
+    if (tilde) {
         char a[64], b[64];
         size_t la = (size_t)(tilde - s);
-        if(la>=sizeof(a)) la=sizeof(a)-1;
-        memcpy(a,s,la); a[la]='\0';
-        strncpy(b,tilde+1,sizeof(b)-1); b[sizeof(b)-1]='\0';
+        if(la >= sizeof(a)) la = sizeof(a)-1;
+        memcpy(a, s, la); a[la] = '\0';
+        strncpy(b, tilde + 1, sizeof(b)-1);
         trim(a); trim(b);
-        float f0=0,f1=0;
-        if(!parse_float(a,&f0) || !parse_float(b,&f1)){ sp.type=SPEC_SILENCE; return sp; }
-        sp.type=SPEC_GLIDE; sp.f0=f0; sp.f1=f1; return sp;
+        parse_float(a, f0); parse_float(b, f1);
+    } else {
+        parse_float(s, f0); *f1 = *f0;
     }
-    if(plus){ // chord: split by '+'
-        sp.type=SPEC_CHORD; sp.n=0;
-        const char *p=s; char tmp[64];
-        while(*p && sp.n<16){
-            const char *q=strchr(p,'+');
-            size_t ln = q? (size_t)(q-p) : strlen(p);
-            if(ln>=sizeof(tmp)) ln=sizeof(tmp)-1;
-            memcpy(tmp,p,ln); tmp[ln]='\0'; trim(tmp);
-            float f=0; if(parse_float(tmp,&f)) sp.chord[sp.n++]=f;
-            if(!q) break; p=q+1;
-        }
-        if(sp.n==0) { sp.type=SPEC_SILENCE; }
-        return sp;
+}
+
+static Spec parse_spec(const char *s){
+    Spec sp = {.type = SPEC_CHORD_GLIDE, .n = 0};
+    for(int k=0; k<16; k++) sp.phase_acc[k] = 0.0;
+
+    if(!s || !*s || s[0]=='r' || s[0]=='0') { sp.type = SPEC_SILENCE; return sp; }
+
+    char *dup = strdup(s);
+    char *saveptr;
+    char *part = strtok_r(dup, "+", &saveptr);
+    while(part && sp.n < 16) {
+        parse_single_glide(part, &sp.f0[sp.n], &sp.f1[sp.n]);
+        sp.n++;
+        part = strtok_r(NULL, "+", &saveptr);
     }
-    // const freq or 0 (rest)
-    float f=0;
-    if(!parse_float(s,&f) || f<=0){ sp.type=SPEC_SILENCE; }
-    else { sp.type=SPEC_CONST; sp.f_const=f; }
+    free(dup);
+    if(sp.n == 0) sp.type = SPEC_SILENCE;
     return sp;
 }
 
 static bool parse_token(const char *arg, int def_ms, Token *out){
-    char *dup=strdup(arg); if(!dup) return false;
-    char *col=strrchr(dup,':'); // last ':' as duration sep
+    char *dup = strdup(arg);
+    char *col = strrchr(dup, ':');
     int dur = def_ms;
-    if(col){ *col='\0'; char *d=col+1; trim(d); dur = atoi(d); if(dur<=0) dur=def_ms; }
-    char *body=dup; trim(body);
-    // rest token can be "r:ms" or "0:ms"
-    if( (body[0]=='r'||body[0]=='R'||body[0]=='0') && (body[1]==0) ){
-        out->L.type=SPEC_SILENCE; out->R.type=SPEC_SILENCE; out->stereo=false; out->dur_ms=dur; free(dup); return true;
-    }
-    // stereo if comma present at top-level
-    char *comma = NULL;
-    int depth=0;
-    for(char *p=body; *p; ++p){ if(*p==','){ comma=p; break; } }
-    if(comma){
-        *comma='\0'; char *ls=body; char *rs=comma+1; trim(ls); trim(rs);
-        out->L = parse_spec(ls);
-        out->R = parse_spec(rs);
-        out->stereo=true;
-    }else{
-        out->L = parse_spec(body);
+    if(col) { *col = '\0'; dur = atoi(col+1); if(dur <= 0) dur = def_ms; }
+    
+    char *comma = strchr(dup, ',');
+    if(comma) {
+        *comma = '\0';
+        out->L = parse_spec(dup);
+        out->R = parse_spec(comma + 1);
+    } else {
+        out->L = parse_spec(dup);
         out->R = out->L;
-        out->stereo=false;
     }
     out->dur_ms = dur;
-    free(dup); return true;
+    free(dup);
+    return true;
 }
 
-static inline float sine(float ph){ return sinf(2.f*(float)M_PI*ph); }
+// --- Synthese-Reaktor ---
 
-static void synth_spec_into(const Spec *sp, float *dst, int n, int sr){
-    if(sp->type==SPEC_SILENCE){ memset(dst,0,n*sizeof(float)); return; }
-    if(sp->type==SPEC_CONST){
-        float f=sp->f_const;
-        for(int i=0;i<n;i++){ float t=(float)i/(float)sr; dst[i]=sine(f*t); }
-        return;
-    }
-    if(sp->type==SPEC_GLIDE){
-        float f0=sp->f0, f1=sp->f1;
-        float phase=0.f;
-        for(int i=0;i<n;i++){
-            float u=(float)i/(float)(n>1?n-1:1);
-            float f = f0 + (f1-f0)*u;      // linear in freq
-            phase += f/(float)sr;
-            dst[i]=sine(phase);
-            if(phase>1.f) phase -= floorf(phase);
+static void synth_spec_chunk(Spec *sp, float *dst, int n, int sr, int64_t t_off, int total_n) {
+    if(sp->type == SPEC_SILENCE) { memset(dst, 0, n * sizeof(float)); return; }
+    
+    double dt = 1.0 / (double)sr;
+    for(int i = 0; i < n; i++) {
+        float u = (float)(t_off + i) / (float)(total_n > 1 ? total_n - 1 : 1);
+        float sample_acc = 0.0f;
+        
+        for(int k = 0; k < sp->n; k++) {
+            float freq = sp->f0[k] + (sp->f1[k] - sp->f0[k]) * u;
+            sp->phase_acc[k] += 2.0 * M_PI * (double)freq * dt;
+            sample_acc += (float)sin(sp->phase_acc[k]);
+            if(sp->phase_acc[k] > 2.0 * M_PI) sp->phase_acc[k] -= 2.0 * M_PI;
         }
-        return;
-    }
-    if(sp->type==SPEC_CHORD){
-        int m=sp->n; if(m<1) { memset(dst,0,n*sizeof(float)); return; }
-        float scale = 1.f/(float)m;
-        for(int i=0;i<n;i++){
-            float t=(float)i/(float)sr, acc=0.f;
-            for(int k=0;k<m;k++) acc += sine(sp->chord[k]*t);
-            dst[i]=acc*scale;
-        }
-        return;
+        dst[i] = sample_acc / (float)sp->n;
     }
 }
 
-static void apply_fade(float *x, int n, int sr, int fade_ms){
+static void apply_fade_chunk(float *x, int n, int sr, int fade_ms, int64_t t_off, int total_n) {
     int f = (int)((fade_ms/1000.0f)*sr);
-    if(f<1) return;
-    if(f*2>n) f = n/2;
-    for(int i=0;i<f;i++){
-        float g = (float)i/(float)f;
-        x[i] *= g;
-        x[n-1-i] *= g;
+    if(f < 1) return;
+    for(int i = 0; i < n; i++) {
+        int64_t pos = t_off + i;
+        float g = 1.0f;
+        if(pos < f) g = (float)pos/(float)f;
+        else if(pos > (int64_t)total_n - f) g = (float)(total_n - pos)/(float)f;
+        x[i] *= (g < 0 ? 0 : g);
     }
 }
-
-static void clamp_and_interleave(int16_t *dst, const float *L, const float *R, int n, float gain){
-    for(int i=0;i<n;i++){
-        float l = L[i]*gain, r = R[i]*gain;
-        if(l>1.f) l=1.f; if(l<-1.f) l=-1.f;
-        if(r>1.f) r=1.f; if(r<-1.f) r=-1.f;
-        dst[2*i+0] = (int16_t)lrintf(l*32767.f);
-        dst[2*i+1] = (int16_t)lrintf(r*32767.f);
-    }
-}
-
-static void die(const char *msg){ fprintf(stderr,"%s\n",msg); exit(1); }
 
 int main(int argc, char **argv){
-    // defaults
-    int sr=44100, def_ms=120, fade_ms=8;
+    int sr=44100, def_ms=120, fade_ms=8, repeat_count=1;
     float gain=0.3f;
-    // parse globals
     int i=1;
     for(; i<argc; ++i){
-        if(strcmp(argv[i],"-sr")==0 && i+1<argc){ sr=atoi(argv[++i]); continue; }
-        if(strcmp(argv[i],"-g")==0 && i+1<argc){ gain=strtof(argv[++i],NULL); continue; }
-        if(strcmp(argv[i],"-l")==0 && i+1<argc){ def_ms=atoi(argv[++i]); continue; }
-        if(strcmp(argv[i],"-fade")==0 && i+1<argc){ fade_ms=atoi(argv[++i]); continue; }
-        if(argv[i][0]=='-'){ fprintf(stderr,"unknown opt: %s\n", argv[i]); return 2; }
-        break;
+        if(strcmp(argv[i],"-sr")==0 && i+1<argc) sr=atoi(argv[++i]);
+        else if(strcmp(argv[i],"-g")==0 && i+1<argc) gain=strtof(argv[++i],NULL);
+        else if(strcmp(argv[i],"-l")==0 && i+1<argc) def_ms=atoi(argv[++i]);
+        else if(strcmp(argv[i],"-fade")==0 && i+1<argc) fade_ms=atoi(argv[++i]);
+        else if(strcmp(argv[i],"-c")==0 && i+1<argc) repeat_count=atoi(argv[++i]);
+        else if(argv[i][0]=='-') continue;
+        else break;
     }
-    if(i>=argc){
-        fprintf(stderr,"oabeep usage:\n  oabeep [-g gain] [-sr rate] [-l ms] [-fade ms] tokens...\n"
-                        "tokens: F[:ms] | L,R[:ms] | A~B[:ms] | f1+f2+...[:ms] | r:ms | 0:ms\n");
-        return 1;
-    }
+    if(i>=argc) return 1;
 
-    // parse tokens
-    int maxTok = argc - i;
-    Token *tok = calloc(maxTok, sizeof(Token)); if(!tok) die("oom");
-    int nt=0; int64_t total_samp=0;
-    for(; i<argc; ++i){
-        Token t;
-        if(!parse_token(argv[i], def_ms, &t)){ free(tok); die("parse error"); }
-        int n = (int)((int64_t)sr * t.dur_ms / 1000);
-        if(n<1) n=1;
-        total_samp += n;
-        tok[nt++] = t;
-    }
+    int nt=0; Token *tok = calloc(argc-i, sizeof(Token));
+    for(int k=i; k<argc; ++k) parse_token(argv[k], def_ms, &tok[nt++]);
 
-    // synth full sequence (stereo)
-    float *L = calloc(total_samp, sizeof(float));
-    float *R = calloc(total_samp, sizeof(float));
-    if(!L||!R) die("oom");
-    int64_t off=0;
-    for(int k=0;k<nt;k++){
-        int n = (int)((int64_t)sr * tok[k].dur_ms / 1000);
-        if(n<1) n=1;
-        synth_spec_into(&tok[k].L, L+off, n, sr);
-        synth_spec_into(&tok[k].R, R+off, n, sr);
-        apply_fade(L+off, n, sr, fade_ms);
-        apply_fade(R+off, n, sr, fade_ms);
-        off += n;
-    }
-
-    // interleave to STEREO16
-    int16_t *pcm = malloc((size_t)total_samp * 2 * sizeof(int16_t));
-    if(!pcm) die("oom pcm");
-    clamp_and_interleave(pcm, L, R, (int)total_samp, gain);
-
-    // OpenAL init
     ALCdevice *dev = alcOpenDevice(NULL);
-    if(!dev) die("alcOpenDevice failed");
     ALCcontext *ctx = alcCreateContext(dev, NULL);
-    if(!ctx || !alcMakeContextCurrent(ctx)) die("alcMakeContextCurrent failed");
+    alcMakeContextCurrent(ctx);
 
-    ALuint buf=0, src=0;
-    alGenBuffers(1,&buf);
-    alBufferData(buf, AL_FORMAT_STEREO16, pcm, (ALsizei)(total_samp*2*sizeof(int16_t)), sr);
-    alGenSources(1,&src);
-    alSourcei(src, AL_SOURCE_RELATIVE, AL_TRUE);
-    alSourcef(src, AL_ROLLOFF_FACTOR, 0.f);
-    alSourcef(src, AL_GAIN, 1.f);
-    const float pos[3]={0,0,0}; alSourcefv(src, AL_POSITION, pos);
-    alSourcei(src, AL_BUFFER, buf);
-    alSourcePlay(src);
+    ALuint source, buffers[NUM_BUFFERS];
+    alGenSources(1, &source);
+    alGenBuffers(NUM_BUFFERS, buffers);
 
-    // wait until done
-    ALint state=0;
-    do { alGetSourcei(src, AL_SOURCE_STATE, &state); usleep(1000*5); } while(state==AL_PLAYING);
+    int16_t *pcm = malloc(CHUNK_SIZE*2*sizeof(int16_t));
+    float *L = malloc(CHUNK_SIZE*sizeof(float)), *R = malloc(CHUNK_SIZE*sizeof(float));
+    int rep=0, t_idx=0; int64_t t_off=0;
 
-    alDeleteSources(1,&src);
-    alDeleteBuffers(1,&buf);
-    alcMakeContextCurrent(NULL);
-    alcDestroyContext(ctx);
-    alcCloseDevice(dev);
-    free(tok); free(L); free(R); free(pcm);
+    while(rep < repeat_count) {
+        ALint proc, queued;
+        alGetSourcei(source, AL_BUFFERS_PROCESSED, &proc);
+        alGetSourcei(source, AL_BUFFERS_QUEUED, &queued);
+        if(queued < NUM_BUFFERS) proc = NUM_BUFFERS - queued;
+
+        while(proc-- > 0 && rep < repeat_count) {
+            ALuint b;
+            if(queued < NUM_BUFFERS) b = buffers[queued++];
+            else alSourceUnqueueBuffers(source, 1, &b);
+
+            int filled = 0;
+            while(filled < CHUNK_SIZE && rep < repeat_count) {
+                int total_s = (int)((int64_t)sr * tok[t_idx].dur_ms / 1000);
+                int rem = total_s - (int)t_off;
+                int take = (CHUNK_SIZE - filled < rem) ? (CHUNK_SIZE - filled) : rem;
+
+                synth_spec_chunk(&tok[t_idx].L, L+filled, take, sr, t_off, total_s);
+                synth_spec_chunk(&tok[t_idx].R, R+filled, take, sr, t_off, total_s);
+                apply_fade_chunk(L+filled, take, sr, fade_ms, t_off, total_s);
+                apply_fade_chunk(R+filled, take, sr, fade_ms, t_off, total_s);
+
+                filled += take; t_off += take;
+                if(t_off >= total_s) { t_off = 0; t_idx++; if(t_idx >= nt) { t_idx = 0; rep++; } }
+            }
+            if(filled > 0) {
+                for(int j=0; j<filled; j++) {
+                    pcm[2*j]   = (int16_t)lrintf(fmaxf(-1.f, fminf(1.f, L[j]*gain)) * 32767.f);
+                    pcm[2*j+1] = (int16_t)lrintf(fmaxf(-1.f, fminf(1.f, R[j]*gain)) * 32767.f);
+                }
+                alBufferData(b, AL_FORMAT_STEREO16, pcm, filled*2*sizeof(int16_t), sr);
+                alSourceQueueBuffers(source, 1, &b);
+                ALint state; alGetSourcei(source, AL_SOURCE_STATE, &state);
+                if(state != AL_PLAYING) alSourcePlay(source);
+            }
+        }
+        usleep(1000);
+    }
+    ALint state; do { alGetSourcei(source, AL_SOURCE_STATE, &state); usleep(5000); } while(state == AL_PLAYING);
     return 0;
 }
